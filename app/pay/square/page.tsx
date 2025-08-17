@@ -1,17 +1,13 @@
-// ===================================================
-// EXISTING FILE: EDIT ONLY INSIDE, DO NOT REWRITE
-// CREATE NEW FILES *ONLY* IF THEY DO NOT EXIST
-// Deliverables: Full copy/paste code only. No inserting into existing code
-// ===================================================
+'use client';
 
-"use client";
-
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
+
+export const dynamic = "force-dynamic";
 
 const BRAND = { bg: "#EAD7BF", green: "#5A7A65", ink: "#2a2a2a", muted: "#5f6a63" };
 
-export default function SquarePayPage() {
+function SquarePayInner() {
   const params = useSearchParams();
   const [status, setStatus] = useState("Preparing secure checkout…");
   const [err, setErr] = useState<string | null>(null);
@@ -28,7 +24,6 @@ export default function SquarePayPage() {
 
     (async () => {
       try {
-        // Prefer POST (matches /app/checkout), then fall back to GET for backward compatibility.
         setStatus("Creating Square link…");
         let r = await fetch("/api/pay/square", {
           method: "POST",
@@ -108,5 +103,13 @@ export default function SquarePayPage() {
         </section>
       </div>
     </main>
+  );
+}
+
+export default function Page() {
+  return (
+    <Suspense fallback={null}>
+      <SquarePayInner />
+    </Suspense>
   );
 }
