@@ -1,0 +1,5 @@
+﻿[
+  { "sku": "RT10", "name": "Retatrutide 10mg", "on_hand": 20, "price_cents": 13500 },
+  { "sku": "RT15", "name": "Retatrutide 15mg", "on_hand": 20, "price_cents": 16000 },
+  { "sku": "GL70", "name": "Glow70 50mg blend", "on_hand": 20, "price_cents": 9500 }
+]
