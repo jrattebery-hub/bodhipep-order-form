@@ -92,7 +92,8 @@ export default function CheckoutPage() {
   );
 
   const subtotal = items.reduce((s, i) => s + i.price * i.qty, 0);
-  const shippingFee = items.length ? 10 : 0;
+  // free shipping > $200 (visual only; server also enforces)
+  const shippingFee = items.length ? (subtotal > 200 ? 0 : 10) : 0;
   const total = subtotal + shippingFee;
 
   function step(sku: string, delta: number) {
@@ -144,7 +145,8 @@ export default function CheckoutPage() {
       const json = await res.json();
       if (!res.ok || !json?.ok) throw new Error(json?.error || `HTTP ${res.status}`);
 
-      window.location.href = `/pay/${payment.toLowerCase()}?order=${json.order_id}&total=${json.total}`;
+      // 🔁 Use server-provided redirect (Square hosted checkout), fallback to internal pay pages
+      window.location.href = json.redirect || `/pay/${payment.toLowerCase()}?order=${json.order_id}&total=${json.total}`;
     } catch (e: any) {
       setError(prettyError(e));
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -157,7 +159,7 @@ export default function CheckoutPage() {
     const d = new Date();
     d.setDate(d.getDate() + 2);
     const d2 = new Date();
-    d2.setDate(d2.getDate() + 3);
+    d2.setDate(d.getDate() + 3);
     return `${d.toLocaleString('en-US', { month: 'short', day: 'numeric' })}–${d2.toLocaleString('en-US', { month: 'short', day: 'numeric' })}`;
   })();
 
@@ -186,7 +188,7 @@ export default function CheckoutPage() {
 
         <h1 className="h-page">Complete Your Order</h1>
         <p className="subtitle">
-          Boutique, research-grade peptides. Flat $10 shipping. Secure checkout.
+          Boutique, research-grade peptides. Flat $10 shipping (free over $200). Secure checkout.
         </p>
 
         {/* trust bar */}
@@ -326,6 +328,7 @@ export default function CheckoutPage() {
             </div>
           ))}
           <div className="rowline"><span>Shipping</span><b className="price">${shippingFee}</b></div>
+          {subtotal > 200 && <div className="muted" style={{marginTop:4}}>Free shipping applied (orders over $200)</div>}
           <div className="divider" />
           <div className="rowline total">
             <span>Total</span><b className="price">${total}</b>
@@ -492,4 +495,3 @@ function ProductRow({ item, qty, step }: { item: Item; qty: number; step: (d: nu
 const US_STATES = [
   'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'
 ];
-

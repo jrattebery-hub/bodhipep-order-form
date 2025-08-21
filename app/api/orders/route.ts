@@ -1,184 +1,186 @@
-export const dynamic = 'force-dynamic';
+// app/api/orders/route.ts
+export const runtime = 'nodejs';
 
-import { promises as fs } from 'fs';
-import path from 'path';
+import crypto from 'crypto';
+import { NextRequest } from 'next/server';
+import { Client, Environment } from 'square';
 
-const dataDir    = path.join(process.cwd(), 'data');
-const invPath    = path.join(dataDir, 'inventory.json');
-const ordersPath = path.join(dataDir, 'orders.json');
-const csvPath    = path.join(dataDir, 'orders.csv');
+import {
+  getProductsBySKUs,
+  patchProductsReserved,
+  createOrder,
+  createOrderItems,
+  findOrCreateClientByEmail,
+} from '@/lib/airtable';
 
-// Toggle these when you're ready to enforce inventory/prices
-const CHECK_STOCK   = false; // when true: block if on_hand < qty and decrement on success
-const REQUIRE_PRICE = false; // when true: missing price -> error
+const FREE_SHIP_THRESHOLD = 200;
+const FLAT_SHIP = 10;
 
-type LineItem   = { sku: string; qty: number };
-type ShippingIn = { method?: string; fee?: number; notes?: string };
-type OrderIn = {
-  name: string; email: string; address1: string;
-  city: string; state: string; zip: string;
-  payment: 'Square' | 'Venmo' | 'CashApp' | 'BTC' | 'ETH' | 'XMR' | 'Other';
-  items: LineItem[];
-  shipping?: ShippingIn;
-};
+const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID!;
+const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL || 'https://bodhipep.com';
 
-// If you don't store price in inventory.json, define here.
-// (If price exists in inventory.json, that wins.)
-const priceList: Record<string, number> = {
-  // RT10: 80,
-  // RT15: 95,
-  // TB10: 45,
-  // CG05: 35,
-  // CG10: 60,
-  // TS10: 50,
-};
+const square = new Client({
+  accessToken: process.env.SQUARE_ACCESS_TOKEN!,
+  environment: process.env.NODE_ENV === 'production' ? Environment.Production : Environment.Sandbox,
+});
 
-async function ensureFiles() {
-  await fs.mkdir(dataDir, { recursive: true });
+function dollars(n: number) { return Math.round(n * 100) / 100; }
+function cents(n: number) { return Math.round(n * 100); }
+function newId() { return 'BD' + Math.random().toString(36).slice(2, 8).toUpperCase(); }
 
-  try { await fs.access(invPath); }      catch { await fs.writeFile(invPath, '[]', 'utf8'); }
-  try { await fs.access(ordersPath); }   catch { await fs.writeFile(ordersPath, '[]', 'utf8'); }
-  try { await fs.access(csvPath); } catch {
-    const header = [
-      'Timestamp','Order No','Payment','Name','Email','Address',
-      'Items','Subtotal','Shipping','Total',
-      // you can add more columns later (e.g., Payment Status / Ref / Handle)
-      'Raw JSON'
-    ].join(',') + '\n';
-    await fs.writeFile(csvPath, header, 'utf8');
-  }
-}
-
-function csvEscape(val: any): string {
-  const s = String(val ?? '');
-  const needsQuotes = /[",\n]/.test(s) || s.startsWith(' ') || s.endsWith(' ');
-  const escaped = s.replace(/"/g, '""');
-  return needsQuotes ? `"${escaped}"` : escaped;
-}
-
-function formatItems(items: LineItem[]): string {
-  return items.map(i => `${i.sku}x${i.qty}`).join('; ');
-}
-
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    await ensureFiles();
-    const body = (await req.json()) as OrderIn;
+    const body = await req.json();
+    const { name, email, address1, city, state, zip, items, payment } = body || {};
 
-    // Basic shape checks
-    if (!body?.items?.length) {
-      return new Response(JSON.stringify({ ok:false, error:'no_items' }), {
-        status: 400, headers:{ 'content-type':'application/json' }
-      });
+    if (!name || !email || !address1 || !city || !state || !zip) {
+      return Response.json({ ok:false, error:'Missing shipping fields' }, { status: 400 });
+    }
+    if (!Array.isArray(items) || !items.length) {
+      return Response.json({ ok:false, error:'Empty cart' }, { status: 400 });
     }
 
-    // Load data
-    const [invText, ordText] = await Promise.all([
-      fs.readFile(invPath, 'utf8'),
-      fs.readFile(ordersPath, 'utf8'),
-    ]);
+    // Aggregate qty by SKU
+    const qtyBySKU: Record<string, number> = {};
+    for (const it of items) {
+      const q = Number(it.qty || 0);
+      if (q > 0) qtyBySKU[String(it.sku)] = (qtyBySKU[String(it.sku)] || 0) + q;
+    }
+    const skus = Object.keys(qtyBySKU);
+    if (!skus.length) return Response.json({ ok:false, error:'Invalid cart' }, { status: 400 });
 
-    type InvItem = { sku: string; on_hand: number; price?: number; [k: string]: any };
-    const inventory: InvItem[] = invText.trim() ? JSON.parse(invText) : [];
-    const orders: any[]        = ordText.trim() ? JSON.parse(ordText) : [];
+    // Fetch authoritative products
+    const prods = await getProductsBySKUs(skus);
+    const bySKU = new Map(prods.map(p => [String(p.fields['SKU']), p]));
 
-    // Validate + compute subtotal
+    // Validate + compute subtotal + prepare reserve patch
     let subtotal = 0;
-    for (const { sku, qty } of body.items) {
-      const item = inventory.find(i => i.sku === sku);
-      if (!item) {
-        return Response.json({ ok:false, error:`unknown_sku:${sku}` }, { status: 400 });
-      }
-      if (!Number.isFinite(qty) || qty <= 0) {
-        return Response.json({ ok:false, error:`bad_qty:${sku}` }, { status: 400 });
-      }
+    const reserveUpdates: Array<{ id: string; newReserved: number }> = [];
 
-      if (CHECK_STOCK && item.on_hand < qty) {
-        return Response.json({ ok:false, error:`insufficient_stock:${sku}`, on_hand:item.on_hand }, { status: 409 });
-      }
+    for (const [sku, qty] of Object.entries(qtyBySKU)) {
+      const rec = bySKU.get(sku);
+      if (!rec) return Response.json({ ok:false, error:`Unknown SKU ${sku}` }, { status: 400 });
 
-      const unitPrice =
-        Number.isFinite(item.price) ? Number(item.price) :
-        (sku in priceList ? priceList[sku] : (REQUIRE_PRICE ? NaN : 0));
+      const price = Number(rec.fields['Price'] || 0);
+      const onHand = Number(rec.fields['OnHand'] || 0);
+      const reserved = Number(rec.fields['Reserved'] || 0);
+      const remaining = 'Remaining' in rec.fields
+        ? Number(rec.fields['Remaining'] || 0)
+        : Math.max(onHand - reserved, 0);
 
-      if (!Number.isFinite(unitPrice)) {
-        return Response.json({ ok:false, error:`missing_price:${sku}` }, { status: 400 });
+      if (qty > remaining) {
+        return Response.json({ ok:false, error:`${sku} only has ${remaining} left` }, { status: 409 });
       }
 
-      subtotal += unitPrice * qty;
+      subtotal += price * qty;
+      reserveUpdates.push({ id: rec.id, newReserved: reserved + qty });
     }
 
-    // Decrement stock only if enforcing inventory
-    if (CHECK_STOCK) {
-      for (const { sku, qty } of body.items) {
-        const item = inventory.find(i => i.sku === sku)!;
-        item.on_hand -= qty;
-      }
+    if (subtotal <= 0) return Response.json({ ok:false, error:'Invalid cart' }, { status: 400 });
+
+    // Shipping rule: free over $200
+    const shipping = subtotal > FREE_SHIP_THRESHOLD ? 0 : FLAT_SHIP;
+    const total = dollars(subtotal + shipping);
+    const order_id = newId();
+
+    // Reserve stock (increment Reserved)
+    if (reserveUpdates.length) {
+      await patchProductsReserved(reserveUpdates);
     }
 
-    // Normalize shipping (defaults)
-    const shipping = {
-      method: body.shipping?.method || 'USPS Priority',
-      fee: Number.isFinite(body.shipping?.fee) ? Number(body.shipping!.fee) : 10,
-      notes: body.shipping?.notes || ''
-    };
+    // Optional: link to client (creates if not exists)
+    let clientLink: string[] | undefined = undefined;
+    try {
+      const client = await findOrCreateClientByEmail(name, email);
+      if (client?.id) clientLink = [client.id];
+    } catch {}
 
-    const total = subtotal + shipping.fee;
-
-    // Compose order record
-    const ts = Date.now();
-    const order_id = `ord_${ts.toString(36)}`;
-    const iso = new Date(ts).toISOString();
-
-    const orderRec = {
-      order_id,
-      ts,
-      ...body,
-      shipping,
-      subtotal,
-      total,
-      // (future) payment fields you might add:
-      // payment_status: 'pending',
-      // amount_received: 0,
-      // payment_ref: '',
-      // payer_handle: '',
-    };
-
-    orders.push(orderRec);
-
-    // Persist JSON (only write inventory if we changed it)
-    if (CHECK_STOCK) {
-      await fs.writeFile(invPath, JSON.stringify(inventory, null, 2), 'utf8');
-    }
-    await fs.writeFile(ordersPath, JSON.stringify(orders, null, 2), 'utf8');
-
-    // Append CSV row
-    const addr = `${body.address1}, ${body.city}, ${body.state} ${body.zip}`;
-    const itemsStr = formatItems(body.items);
-    const rawCompact = JSON.stringify(orderRec); // one line
-
-    const row = [
-      csvEscape(iso),
-      csvEscape(order_id),
-      csvEscape(body.payment),
-      csvEscape(body.name),
-      csvEscape(body.email),
-      csvEscape(addr),
-      csvEscape(itemsStr),
-      csvEscape(subtotal.toFixed(2)),
-      csvEscape(shipping.fee.toFixed(2)),
-      csvEscape(total.toFixed(2)),
-      csvEscape(rawCompact),
-    ].join(',') + '\n';
-
-    await fs.appendFile(csvPath, row, 'utf8');
-
-    return Response.json({ ok:true, order_id, total, shipping }, { status: 200 });
-  } catch (e: any) {
-    return new Response(JSON.stringify({ ok:false, error:e?.message || 'server_error' }), {
-      status: 500, headers:{ 'content-type':'application/json' }
+    // Create Airtable Order
+    const shipTo = `${name}\n${address1}\n${city}, ${state} ${zip}`;
+    const orderRec = await createOrder({
+      OrderID: order_id,
+      Status: 'PENDING',
+      Payment: payment || '',
+      Subtotal: dollars(subtotal),
+      Shipping: dollars(shipping),
+      Total: total,
+      Email: email,
+      'Ship To': shipTo,
+      ...(clientLink ? { Client: clientLink } : {}),
     });
+
+    // Create Airtable Order Items
+    const itemRecords = Object.entries(qtyBySKU).map(([sku, qty]) => {
+      const p = bySKU.get(sku)!;
+      const unit = Number(p.fields['Price'] || 0);
+      return { fields: {
+        Order: [orderRec.id],
+        Product: [p.id],
+        Qty: qty,
+        UnitPrice: unit,
+      }};
+    });
+    if (itemRecords.length) await createOrderItems(itemRecords);
+
+    // If Square, build a hosted checkout link and return it as `redirect`
+    if (String(payment).toLowerCase() === 'square') {
+      const lineItems = Object.entries(qtyBySKU).map(([sku, qty]) => {
+        const p = bySKU.get(sku)!;
+        const unit = Number(p.fields['Price'] || 0);
+        return {
+          name: sku, // or use p.fields['Name'] if you have one
+          quantity: String(qty),
+          basePriceMoney: { amount: BigInt(cents(unit)), currency: 'USD' as const },
+          note: sku,
+        };
+      });
+
+      const serviceCharges = shipping > 0 ? [{
+        name: 'Shipping',
+        amountMoney: { amount: BigInt(cents(shipping)), currency: 'USD' as const },
+        calculationPhase: 'TOTAL_PHASE' as const,
+        taxable: false,
+      }] : [];
+
+      const orderResp = await square.ordersApi.createOrder({
+        order: {
+          locationId: SQUARE_LOCATION_ID,
+          referenceId: order_id,
+          lineItems,
+          serviceCharges,
+          metadata: { airtable_id: orderRec.id, order_no: order_id },
+        },
+        idempotencyKey: crypto.randomUUID(),
+      });
+
+      const sqOrderId = orderResp.result.order?.id;
+      if (!sqOrderId) throw new Error('Square order not created');
+
+      const linkResp = await square.paymentLinksApi.createPaymentLink({
+        idempotencyKey: crypto.randomUUID(),
+        orderId: sqOrderId,
+        checkoutOptions: {
+          askForShippingAddress: true,
+          allowTipping: false,
+          redirectUrl: `${BASE_URL}/thank-you?o=${encodeURIComponent(order_id)}`,
+          merchantSupportEmail: 'orders@bodhipep.com',
+        },
+        // We could prefill email/address here if desired
+      });
+
+      const redirect = linkResp.result.paymentLink?.url;
+      if (!redirect) throw new Error('Square payment link not created');
+
+      return Response.json({ ok:true, order_id, total, redirect });
+    }
+
+    // For Venmo/CashApp/Crypto: send to internal pay pages
+    const method = String(payment || '').toLowerCase();
+    const redirect = `/pay/${method}?order=${order_id}&total=${total}`;
+
+    return Response.json({ ok:true, order_id, total, redirect });
+  } catch (e: any) {
+    console.error('ORDERS ERROR', e?.message || e);
+    return Response.json({ ok:false, error:'server_error' }, { status: 500 });
   }
 }
-
-
